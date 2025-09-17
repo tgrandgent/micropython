@@ -34,6 +34,7 @@ target_sources(micropy_extmod_btstack INTERFACE
     ${BTSTACK_LIB_DIR}/src/ble/gatt-service/ublox_spp_service_server.c
     ${BTSTACK_LIB_DIR}/src/ble/gatt_client.c
     ${BTSTACK_LIB_DIR}/src/ble/le_device_db_memory.c
+    ${BTSTACK_LIB_DIR}/src/ble/le_device_db_tlv.c
     ${BTSTACK_LIB_DIR}/src/ble/sm.c
     ${BTSTACK_LIB_DIR}/src/btstack_audio.c
     ${BTSTACK_LIB_DIR}/src/btstack_base64_decoder.c

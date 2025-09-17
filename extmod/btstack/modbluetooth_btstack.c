@@ -34,8 +34,10 @@
 #include "extmod/modbluetooth.h"
 
 #include "lib/btstack/src/btstack.h"
+#include "lib/btstack/src/btstack_tlv.h"
+#include "lib/btstack/src/ble/le_device_db_tlv.h"
 
-#define DEBUG_printf(...) // printf("btstack: " __VA_ARGS__)
+#define DEBUG_printf(...) // mp_printf(MICROPY_ERROR_PRINTER, "btstack: " __VA_ARGS__)
 
 #ifndef MICROPY_PY_BLUETOOTH_DEFAULT_GAP_NAME
 #define MICROPY_PY_BLUETOOTH_DEFAULT_GAP_NAME "MPY BTSTACK"
@@ -193,6 +195,56 @@ static bool controller_static_addr_available = false;
 static const uint8_t read_static_address_command_complete_prefix[] = { 0x0e, 0x1b, 0x01, 0x09, 0xfc };
 #endif
 
+#if MICROPY_PY_BLUETOOTH_ENABLE_PAIRING_BONDING
+// Must be distinct to BLE_STORE_OBJ_TYPE_ in ble_store.h.
+#define SECRET_TYPE_BTSTACK_TLV 10
+
+typedef struct {
+    uint32_t reserved;
+} mp_btstack_tlv_ctx_t;
+
+static int btstack_tlv_get_tag(void *context, uint32_t tag, uint8_t *buffer, uint32_t buffer_size) {
+    (void)context;
+
+    const uint8_t *val = NULL;
+    size_t val_len = 0;
+
+    bool ok = mp_bluetooth_gap_on_get_secret(SECRET_TYPE_BTSTACK_TLV, 0, (uint8_t *)&tag, sizeof(tag), &val, &val_len);
+    if (!ok) {
+        return 0;
+    }
+    if (buffer && buffer_size) {
+        size_t n = val_len < buffer_size ? val_len : buffer_size;
+        memcpy(buffer, val, n);
+    }
+    return val_len;
+}
+
+static int btstack_tlv_store_tag(void *context, uint32_t tag, const uint8_t *data, uint32_t data_size) {
+    (void)context;
+
+    if (mp_bluetooth_gap_on_set_secret(SECRET_TYPE_BTSTACK_TLV, (uint8_t *)&tag, sizeof(tag), data, data_size)) {
+        return 0;
+    }
+
+    return -1;
+}
+
+static void btstack_tlv_delete_tag(void *context, uint32_t tag) {
+    (void)context;
+
+    mp_bluetooth_gap_on_set_secret(SECRET_TYPE_BTSTACK_TLV, (uint8_t *)&tag, sizeof(tag), NULL, 0);
+}
+
+static const btstack_tlv_t mp_btstack_tlv_impl = {
+    .get_tag = btstack_tlv_get_tag,
+    .store_tag = btstack_tlv_store_tag,
+    .delete_tag = btstack_tlv_delete_tag,
+};
+
+static mp_btstack_tlv_ctx_t mp_btstack_tlv_ctx;
+#endif // MICROPY_PY_BLUETOOTH_ENABLE_PAIRING_BONDING
+
 static void btstack_packet_handler_generic(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
     (void)channel;
     (void)size;
@@ -300,7 +352,51 @@ static void btstack_packet_handler_generic(uint8_t packet_type, uint16_t channel
             desc->sm_connection_authenticated,
             desc->sm_le_db_index != -1,
             desc->sm_actual_encryption_key_size);
-        #endif // MICROPY_PY_BLUETOOTH_ENABLE_PAIRING_BONDING
+    } else if (event_type == SM_EVENT_JUST_WORKS_REQUEST) {
+        DEBUG_printf("  --> sm just works request\n");
+        sm_just_works_confirm(sm_event_just_works_request_get_handle(packet));
+    } else if (event_type == SM_EVENT_NUMERIC_COMPARISON_REQUEST) {
+        DEBUG_printf("  --> sm numeric comparison request\n");
+        sm_numeric_comparison_confirm(sm_event_passkey_display_number_get_handle(packet));
+    } else if (event_type == SM_EVENT_PASSKEY_DISPLAY_NUMBER) {
+        DEBUG_printf("  --> sm passkey display number\n");
+    } else if (event_type == SM_EVENT_IDENTITY_RESOLVING_STARTED) {
+        DEBUG_printf("  --> sm identity resolving started\n");
+    } else if (event_type == SM_EVENT_IDENTITY_RESOLVING_FAILED) {
+        DEBUG_printf("  --> sm identity resolving failed\n");
+    } else if (event_type == SM_EVENT_IDENTITY_RESOLVING_SUCCEEDED) {
+        DEBUG_printf("  --> sm identity resolving succeeded\n");
+    } else if (event_type == SM_EVENT_PAIRING_STARTED) {
+        DEBUG_printf("  --> sm pairing started\n");
+    } else if (event_type == SM_EVENT_IDENTITY_CREATED) {
+        DEBUG_printf("  --> sm identity created\n");
+    } else if (event_type == SM_EVENT_REENCRYPTION_STARTED) {
+        DEBUG_printf("  --> sm re-encryption started\n");
+    } else if (event_type == SM_EVENT_REENCRYPTION_COMPLETE) {
+        DEBUG_printf("  --> sm re-encryption complete\n");
+        uint16_t conn_handle = sm_event_reencryption_complete_get_handle(packet);
+        switch (sm_event_reencryption_complete_get_status(packet)) {
+            case ERROR_CODE_SUCCESS:
+                DEBUG_printf("  --> sm re-encryption complete, success\n");
+                break;
+            case ERROR_CODE_CONNECTION_TIMEOUT:
+                DEBUG_printf("  --> sm re-encryption complete, connection timeout\n");
+                gap_disconnect(conn_handle);
+                break;
+            case ERROR_CODE_REMOTE_USER_TERMINATED_CONNECTION:
+                DEBUG_printf("  --> sm re-encryption complete, remote user terminated connection\n");
+                gap_disconnect(conn_handle);
+                break;
+            case ERROR_CODE_PIN_OR_KEY_MISSING:
+                DEBUG_printf("  --> sm re-encryption complete, code pin or key missing\n");
+                bd_addr_t addr;
+                sm_event_reencryption_complete_get_address(packet, addr);
+                uint8_t type = sm_event_reencryption_started_get_addr_type(packet);
+                gap_delete_bonding(type, addr);
+                gap_disconnect(conn_handle);
+                break;
+        }
+#endif // MICROPY_PY_BLUETOOTH_ENABLE_PAIRING_BONDING
     } else if (event_type == HCI_EVENT_DISCONNECTION_COMPLETE) {
         DEBUG_printf("  --> hci disconnect complete\n");
         uint16_t conn_handle = hci_event_disconnection_complete_get_connection_handle(packet);
@@ -624,6 +720,12 @@ int mp_bluetooth_init(void) {
 
     l2cap_init();
     le_device_db_init();
+
+#ifdef MICROPY_PY_BLUETOOTH_ENABLE_PAIRING_BONDING
+    btstack_tlv_set_instance(&mp_btstack_tlv_impl, &mp_btstack_tlv_ctx);
+    le_device_db_tlv_configure(&mp_btstack_tlv_impl, &mp_btstack_tlv_ctx);
+#endif // MICROPY_PY_BLUETOOTH_ENABLE_PAIRING_BONDING
+
     sm_init();
 
     // Set blank ER/IR keys to suppress BTstack warning.
@@ -642,6 +744,11 @@ int mp_bluetooth_init(void) {
 
     // Register for HCI events.
     hci_add_event_handler(&hci_event_callback_registration);
+
+#ifdef MICROPY_PY_BLUETOOTH_ENABLE_PAIRING_BONDING
+    // Register for SM events.
+    sm_add_event_handler(&hci_event_callback_registration);
+#endif // MICROPY_PY_BLUETOOTH_ENABLE_PAIRING_BONDING
 
     // Register for ATT server events.
     att_server_register_packet_handler(&btstack_packet_handler_att_server);

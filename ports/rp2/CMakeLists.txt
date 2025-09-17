@@ -359,6 +359,7 @@ if (MICROPY_BLUETOOTH_BTSTACK)
     target_compile_definitions(${MICROPY_TARGET} PRIVATE
         MICROPY_BLUETOOTH_BTSTACK=1
         MICROPY_BLUETOOTH_BTSTACK_CONFIG_FILE=\"btstack_inc/btstack_config.h\"
+        MICROPY_PY_BLUETOOTH_ENABLE_PAIRING_BONDING=1
     )
 
     # For modbluetooth_btstack.c includes
